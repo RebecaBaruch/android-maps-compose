@@ -16,8 +16,11 @@
 
 package com.google.maps.android.compose.clustering
 
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.snapshotFlow
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -77,6 +80,8 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
     private val clusterItemContentAnchorState: State<Offset>,
     private val clusterContentZIndexState: State<Float>,
     private val clusterItemContentZIndexState: State<Float>,
+    private val clusterContentRotationState: State<Float>,
+    private val clusterItemContentRotationState: State<Float>,
 ) : DefaultClusterRenderer<T>(
     context,
     map,
@@ -89,9 +94,7 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
     private val keysToViews = mutableMapOf<ViewKey<T>, ViewInfo>()
 
     private val fakeLifecycleOwner = object : LifecycleOwner {
-        private val lifecycleRegistry = LifecycleRegistry(this).apply {
-            currentState = Lifecycle.State.RESUMED
-        }
+        val lifecycleRegistry = LifecycleRegistry(this)
         override val lifecycle: Lifecycle get() = lifecycleRegistry
     }
 
@@ -102,6 +105,50 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
         }
         override val savedStateRegistry: SavedStateRegistry get() = controller.savedStateRegistry
         override val lifecycle: Lifecycle get() = fakeLifecycleOwner.lifecycle
+        init {
+            fakeLifecycleOwner.lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+        }
+    }
+
+    init {
+        // Observe top-level Clustering property state updates across rotation, anchor, and zIndex.
+        // When these states update from a parent recomposition, actively push the updated values
+        // to any existing Marker objects currently on the map.
+        scope.launch {
+            snapshotFlow {
+                listOf(
+                    clusterContentRotationState.value,
+                    clusterItemContentRotationState.value,
+                    clusterContentAnchorState.value,
+                    clusterItemContentAnchorState.value,
+                    clusterContentZIndexState.value,
+                    clusterItemContentZIndexState.value,
+                )
+            }.collect {
+                keysToViews.forEach { (key, viewInfo) ->
+                    when (key) {
+                        is ViewKey.Cluster -> {
+                            getMarker(key.cluster)?.apply {
+                                val props = viewInfo.view.properties
+                                val anchor = props.anchor ?: clusterContentAnchorState.value
+                                setAnchor(anchor.x, anchor.y)
+                                zIndex = props.zIndex ?: clusterContentZIndexState.value
+                                rotation = props.rotation ?: clusterContentRotationState.value
+                            }
+                        }
+                        is ViewKey.Item -> {
+                            getMarker(key.item)?.apply {
+                                val props = viewInfo.view.properties
+                                val anchor = props.anchor ?: clusterItemContentAnchorState.value
+                                setAnchor(anchor.x, anchor.y)
+                                zIndex = props.zIndex ?: clusterItemContentZIndexState.value
+                                rotation = props.rotation ?: clusterItemContentRotationState.value
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     override fun onClustersChanged(clusters: Set<Cluster<T>>) {
@@ -152,6 +199,24 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
     private fun createAndAddView(key: ViewKey<T>): ViewInfo {
         val view = InvalidatingComposeView(
             context,
+            getRotation = {
+                when (key) {
+                    is ViewKey.Cluster -> clusterContentRotationState.value
+                    is ViewKey.Item -> clusterItemContentRotationState.value
+                }
+            },
+            getAnchor = {
+                when (key) {
+                    is ViewKey.Cluster -> clusterContentAnchorState.value
+                    is ViewKey.Item -> clusterItemContentAnchorState.value
+                }
+            },
+            getZIndex = {
+                when (key) {
+                    is ViewKey.Cluster -> clusterContentZIndexState.value
+                    is ViewKey.Item -> clusterItemContentZIndexState.value
+                }
+            },
             content = when (key) {
                 is ViewKey.Cluster -> {
                     { clusterContentState.value?.invoke(key.cluster) }
@@ -205,33 +270,44 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
         }
             .collectLatest {
                 when (key) {
-                    is ViewKey.Cluster -> getMarker(key.cluster)
-                    is ViewKey.Item -> getMarker(key.item)
-                }?.apply {
-                    setIcon(renderViewToBitmapDescriptor(view))
-                    view.properties.anchor?.let { setAnchor(it.x, it.y) }
-                    view.properties.zIndex?.let { zIndex = it }
+                    is ViewKey.Cluster -> {
+                        getMarker(key.cluster)?.apply {
+                            setIcon(renderViewToBitmapDescriptor(view))
+                            val anchor = view.properties.anchor ?: clusterContentAnchorState.value
+                            setAnchor(anchor.x, anchor.y)
+                            zIndex = view.properties.zIndex ?: clusterContentZIndexState.value
+                            rotation = view.properties.rotation ?: clusterContentRotationState.value
+                        }
+                    }
+                    is ViewKey.Item -> {
+                        getMarker(key.item)?.apply {
+                            setIcon(renderViewToBitmapDescriptor(view))
+                            val anchor = view.properties.anchor ?: clusterItemContentAnchorState.value
+                            setAnchor(anchor.x, anchor.y)
+                            zIndex = view.properties.zIndex ?: clusterItemContentZIndexState.value
+                            rotation = view.properties.rotation ?: clusterItemContentRotationState.value
+                        }
+                    }
                 }
             }
-
     }
 
     override fun onBeforeClusterRendered(cluster: Cluster<T>, markerOptions: MarkerOptions) {
         super.onBeforeClusterRendered(cluster, markerOptions)
-
         if (clusterContentState.value != null) {
-            val anchor = clusterContentAnchorState.value
+            val viewInfo = keysToViews[ViewKey.Cluster(cluster)]
+            val props = viewInfo?.view?.properties
+            val anchor = props?.anchor ?: clusterContentAnchorState.value
             markerOptions.anchor(anchor.x, anchor.y)
-            markerOptions.zIndex(clusterContentZIndexState.value)
+            markerOptions.zIndex(props?.zIndex ?: clusterContentZIndexState.value)
+            markerOptions.rotation(props?.rotation ?: clusterContentRotationState.value)
         }
     }
 
     override fun getDescriptorForCluster(cluster: Cluster<T>): BitmapDescriptor {
         if (!scope.isActive) return super.getDescriptorForCluster(cluster)
         return if (clusterContentState.value != null) {
-            val viewInfo = keysToViews.entries
-                .firstOrNull { (key, _) -> (key as? ViewKey.Cluster)?.cluster == cluster }
-                ?.value
+            val viewInfo = keysToViews[ViewKey.Cluster(cluster)]
 
             if (viewInfo != null) {
                 renderViewToBitmapDescriptor(viewInfo.view)
@@ -247,19 +323,17 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
 
     override fun onBeforeClusterItemRendered(item: T, markerOptions: MarkerOptions) {
         super.onBeforeClusterItemRendered(item, markerOptions)
-
         if (!scope.isActive) return
 
         if (clusterItemContentState.value != null) {
-            val viewInfo = keysToViews.entries
-                .firstOrNull { (key, _) -> (key as? ViewKey.Item)?.item == item }
-                ?.value
-                ?: createAndAddView(ViewKey.Item(item))
+            val viewInfo = keysToViews[ViewKey.Item(item)] ?: createAndAddView(ViewKey.Item(item))
             markerOptions.icon(renderViewToBitmapDescriptor(viewInfo.view))
 
-            val anchor = clusterItemContentAnchorState.value
+            val props = viewInfo.view.properties
+            val anchor = props.anchor ?: clusterItemContentAnchorState.value
             markerOptions.anchor(anchor.x, anchor.y)
-            markerOptions.zIndex(clusterItemContentZIndexState.value)
+            markerOptions.zIndex(props.zIndex ?: clusterItemContentZIndexState.value)
+            markerOptions.rotation(props.rotation ?: clusterItemContentRotationState.value)
         }
     }
 
@@ -297,7 +371,7 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
     }
 
     private class ViewInfo(
-        val view: AbstractComposeView,
+        val view: InvalidatingComposeView,
         val onRemove: () -> Unit,
     )
 
@@ -307,6 +381,9 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
      */
     private class InvalidatingComposeView(
         context: Context,
+        private val getRotation: () -> Float,
+        private val getAnchor: () -> Offset,
+        private val getZIndex: () -> Float,
         private val content: @Composable () -> Unit,
     ) : AbstractComposeView(context) {
 
@@ -315,14 +392,22 @@ internal class ComposeUiClusterRenderer<T : ClusterItem>(
 
         @Composable
         override fun Content() {
-            androidx.compose.runtime.LaunchedEffect(properties.anchor, properties.zIndex) {
+            val rotation = getRotation()
+            val anchor = getAnchor()
+            val zIndex = getZIndex()
+            LaunchedEffect(properties.anchor, properties.zIndex, properties.rotation, rotation, anchor, zIndex) {
                 invalidate()
             }
-            androidx.compose.runtime.CompositionLocalProvider(
+            CompositionLocalProvider(
                 LocalClusteringMarkerProperties provides properties
             ) {
                 content()
             }
+        }
+
+        override fun invalidate() {
+            super.invalidate()
+            onInvalidate?.invoke()
         }
 
         override fun onDescendantInvalidated(child: View, target: View) {
